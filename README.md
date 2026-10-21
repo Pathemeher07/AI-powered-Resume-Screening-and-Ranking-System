@@ -40,8 +40,8 @@ Screen PDF and DOCX resumes against a job description with deterministic matchin
 3. Configure the Gemini API key for server-side use. Create `.env.local` in the project root:
    ```env
    GEMINI_API_KEY=your_google_ai_studio_api_key
-   # Optional model override; defaults to gemini-3.1-flash-lite
-   GEMINI_MODEL=gemini-3.1-flash-lite
+   # Optional model override; defaults to gemini-3.5-flash-lite
+   GEMINI_MODEL=gemini-3.5-flash-lite
    ```
    Keep the key out of `NEXT_PUBLIC_*` variables. `.env*` is ignored by Git.
 4. Start the development server:

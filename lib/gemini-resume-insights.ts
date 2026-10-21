@@ -11,7 +11,7 @@ import type {
   ResumeInsights,
   ResumeSkillInsight,
 } from "@/lib/types"
-import { normalizeSkill } from "@/lib/job-skills"
+import { extractSkills, normalizeSkill } from "@/lib/job-skills"
 
 const responseSchema = {
   type: Type.OBJECT,
@@ -41,7 +41,6 @@ const responseSchema = {
     },
     relevantProjectsAndExperience: {
       type: Type.ARRAY,
-      minItems: "1",
       items: {
         type: Type.OBJECT,
         required: ["finding", "status", "evidence"],
@@ -54,7 +53,6 @@ const responseSchema = {
     },
     transferableExperience: {
       type: Type.ARRAY,
-      minItems: "1",
       items: {
         type: Type.OBJECT,
         required: ["finding", "status", "evidence"],
@@ -67,7 +65,6 @@ const responseSchema = {
     },
     strengths: {
       type: Type.ARRAY,
-      minItems: "1",
       items: {
         type: Type.OBJECT,
         required: ["finding", "status", "evidence"],
@@ -130,6 +127,18 @@ type InsightsGenerator = (
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+class GeminiStageError extends Error {
+  constructor(
+    readonly stage: "response_parsing" | "response_validation",
+    message: string,
+    cause: unknown,
+  ) {
+    super(message)
+    this.name = "GeminiStageError"
+    Object.defineProperty(this, "cause", { value: cause, configurable: true })
+  }
 }
 
 function readStringArray(value: unknown, field: string, maxItems = 12): string[] {
@@ -235,22 +244,41 @@ function readEvidenceArray(
   if (!Array.isArray(value) || (!allowEmpty && value.length === 0) || value.length > 12) {
     throw new Error(`Invalid Gemini ${field}.`)
   }
-  return value.map((item) => readEvidence(item, field, resumeText))
+  return value.flatMap((item, index) => {
+    try {
+      return [readEvidence(item, field, resumeText)]
+    } catch {
+      if (!allowEmpty) throw new Error(`Invalid Gemini ${field}.`)
+      logGeminiDiagnostic("validation", {
+        errorCode: "INVALID_OPTIONAL_EVIDENCE_DROPPED",
+        field: `${field}[${index}]`,
+      })
+      return []
+    }
+  })
 }
 
 function readImprovementSuggestions(value: unknown, resumeText: string): ResumeImprovementSuggestion[] {
   if (!Array.isArray(value) || value.length > 12) throw new Error("Invalid Gemini suggestions.")
-  return value.map((item) => {
-    if (!isRecord(item)) throw new Error("Invalid Gemini suggestion.")
-    const evidence = readEvidence({
-      finding: item.suggestion,
-      status: item.evidenceStatus,
-      evidence: item.evidence,
-    }, "suggestion", resumeText)
-    return {
-      suggestion: evidence.finding,
-      evidenceStatus: evidence.status,
-      evidence: evidence.evidence,
+  return value.flatMap((item, index) => {
+    try {
+      if (!isRecord(item)) throw new Error("Invalid Gemini suggestion.")
+      const evidence = readEvidence({
+        finding: item.suggestion,
+        status: item.evidenceStatus,
+        evidence: item.evidence,
+      }, "suggestion", resumeText)
+      return [{
+        suggestion: evidence.finding,
+        evidenceStatus: evidence.status,
+        evidence: evidence.evidence,
+      }]
+    } catch {
+      logGeminiDiagnostic("validation", {
+        errorCode: "INVALID_OPTIONAL_SUGGESTION_DROPPED",
+        field: `improvementSuggestions[${index}]`,
+      })
+      return []
     }
   })
 }
@@ -273,62 +301,87 @@ function validateProposedClaims(proposedText: string, supportingEvidence: string
 
 function readCoachSuggestions(value: unknown, resumeText: string): ResumeCoachSuggestion[] {
   if (!Array.isArray(value) || value.length > 12) throw new Error("Invalid Gemini coach suggestions.")
-  return value.map((item, index) => {
-    if (
-      !isRecord(item) ||
-      !["bullet_point", "project_emphasis", "skill_description", "missing_evidence"].includes(String(item.type)) ||
-      !["high", "medium", "low"].includes(String(item.priority)) ||
-      typeof item.proposedText !== "string" ||
-      typeof item.rationale !== "string"
-    ) {
-      throw new Error("Invalid Gemini coach suggestion.")
-    }
-    const type = item.type as ResumeCoachSuggestion["type"]
-    const priority = item.priority as ResumeCoachSuggestion["priority"]
-    const proposedText = item.proposedText.trim()
-    const rationale = item.rationale.trim()
-    if (!proposedText || proposedText.length > 1000 || !rationale || rationale.length > 400) {
-      throw new Error("Invalid Gemini coach suggestion text.")
-    }
-    const supportingEvidence = readStringArray(item.supportingEvidence, "coach evidence", 4)
-    if (supportingEvidence.some((excerpt) => !isEvidenceInResume(excerpt, resumeText))) {
-      throw new Error("Gemini cited coach evidence that is not in the resume.")
-    }
-    const confirmationQuestions = readStringArray(item.confirmationQuestions, "confirmation questions", 3)
-    const placeholders = [...proposedText.matchAll(/\{\{CONFIRM_(\d+)\}\}/g)].map((match) => Number(match[1]))
-    if (placeholders.some((placeholder) => placeholder >= confirmationQuestions.length)) {
-      throw new Error("Gemini returned an unresolved confirmation placeholder.")
-    }
-    if (confirmationQuestions.length !== placeholders.length) {
-      throw new Error("Each confirmation question must have a matching draft placeholder.")
-    }
-
-    let originalText: string | null
-    if (type === "missing_evidence") {
-      if (item.originalText !== null || !confirmationQuestions.length || !placeholders.length || supportingEvidence.length) {
-        throw new Error("Missing-evidence suggestions must ask the user to confirm missing facts.")
+  return value.flatMap((item, index) => {
+    try {
+      if (
+        !isRecord(item) ||
+        !["bullet_point", "project_emphasis", "skill_description", "missing_evidence"].includes(String(item.type)) ||
+        !["high", "medium", "low"].includes(String(item.priority)) ||
+        typeof item.proposedText !== "string" ||
+        typeof item.rationale !== "string"
+      ) {
+        throw new Error("Invalid Gemini coach suggestion.")
       }
-      originalText = null
-    } else {
-      if (typeof item.originalText !== "string" || !item.originalText.trim() || !isEvidenceInResume(item.originalText, resumeText)) {
-        throw new Error("Coach source text must exactly match the resume.")
+      const type = item.type as ResumeCoachSuggestion["type"]
+      const priority = item.priority as ResumeCoachSuggestion["priority"]
+      const proposedText = item.proposedText.trim()
+      const rationale = item.rationale.trim()
+      if (!proposedText || proposedText.length > 1000 || !rationale || rationale.length > 400) {
+        throw new Error("Invalid Gemini coach suggestion text.")
       }
-      if (!supportingEvidence.length) throw new Error("Coach rewrites require resume evidence.")
-      originalText = item.originalText.trim()
-      validateProposedClaims(proposedText, supportingEvidence, originalText)
-    }
+      const supportingEvidence = readStringArray(item.supportingEvidence, "coach evidence", 4)
+      if (supportingEvidence.some((excerpt) => !isEvidenceInResume(excerpt, resumeText))) {
+        throw new Error("Gemini cited coach evidence that is not in the resume.")
+      }
+      const confirmationQuestions = readStringArray(item.confirmationQuestions, "confirmation questions", 3)
+      const placeholders = [...proposedText.matchAll(/\{\{CONFIRM_(\d+)\}\}/g)].map((match) => Number(match[1]))
+      if (placeholders.some((placeholder) => placeholder >= confirmationQuestions.length)) {
+        throw new Error("Gemini returned an unresolved confirmation placeholder.")
+      }
+      if (confirmationQuestions.length !== placeholders.length) {
+        throw new Error("Each confirmation question must have a matching draft placeholder.")
+      }
 
-    return {
-      id: `coach-${index + 1}`,
-      type,
-      priority,
-      originalText,
-      proposedText,
-      rationale,
-      supportingEvidence,
-      confirmationQuestions,
+      let originalText: string | null
+      if (type === "missing_evidence") {
+        if (item.originalText !== null || !confirmationQuestions.length || !placeholders.length || supportingEvidence.length) {
+          throw new Error("Missing-evidence suggestions must ask the user to confirm missing facts.")
+        }
+        originalText = null
+      } else {
+        if (typeof item.originalText !== "string" || !item.originalText.trim() || !isEvidenceInResume(item.originalText, resumeText)) {
+          throw new Error("Coach source text must exactly match the resume.")
+        }
+        if (!supportingEvidence.length) throw new Error("Coach rewrites require resume evidence.")
+        originalText = item.originalText.trim()
+        validateProposedClaims(proposedText, supportingEvidence, originalText)
+      }
+
+      return [{
+        id: `coach-${index + 1}`,
+        type,
+        priority,
+        originalText,
+        proposedText,
+        rationale,
+        supportingEvidence,
+        confirmationQuestions,
+      }]
+    } catch (error) {
+      const unsupportedClaim = error instanceof Error && error.message === "Gemini proposed unsupported resume claims."
+      logGeminiDiagnostic("validation", {
+        errorCode: unsupportedClaim ? "UNSUPPORTED_COACH_CLAIM" : "INVALID_OPTIONAL_COACH_SUGGESTION",
+        field: unsupportedClaim ? `coachSuggestions[${index}].proposedText` : `coachSuggestions[${index}]`,
+        optionalSuggestionDropped: true,
+      })
+      return []
     }
   })
+}
+
+function findSkillEvidenceExcerpt(skill: string, resumeText: string): string | undefined {
+  const normalizedSkill = normalizeSkill(skill)
+  for (const line of resumeText.split(/\r?\n/)) {
+    const trimmedLine = line.trim()
+    if (trimmedLine.length <= 600 && extractSkills(trimmedLine).includes(normalizedSkill)) {
+      return trimmedLine
+    }
+    for (let start = 0; start < trimmedLine.length; start += 500) {
+      const excerpt = trimmedLine.slice(start, start + 600).trim()
+      if (extractSkills(excerpt).includes(normalizedSkill)) return excerpt
+    }
+  }
+  return undefined
 }
 
 function readSkillInsights(
@@ -340,7 +393,7 @@ function readSkillInsights(
   const requiredSkills = new Map(jobRequirements.requiredSkills.map((skill) => [skill.toLocaleLowerCase(), skill]))
   const normalizedRequiredSkills = new Map(jobRequirements.requiredSkills.map((skill) => [normalizeSkill(skill).toLocaleLowerCase(), skill]))
   const jobText = `${jobRequirements.jobTitle}\n${jobRequirements.jobDescription}`.toLocaleLowerCase()
-  const skills = value.map((item): ResumeSkillInsight => {
+  const skills = value.flatMap((item, index): ResumeSkillInsight[] => {
     if (
       !isRecord(item) ||
       typeof item.skill !== "string" ||
@@ -359,28 +412,55 @@ function readSkillInsights(
       if (jobText.includes(skill.toLocaleLowerCase()) || jobText.includes(normalizeSkill(skill).toLocaleLowerCase())) {
         priority = "preferred"
       } else {
-        throw new Error("Gemini returned an unrequested required skill.")
+        logGeminiDiagnostic("validation", {
+          errorCode: "UNREQUESTED_REQUIRED_SKILL_DROPPED",
+          field: `skills[${index}].priority`,
+        })
+        return []
       }
     }
     if (priority === "preferred" && !jobText.includes(skill.toLocaleLowerCase()) && !jobText.includes(normalizeSkill(skill).toLocaleLowerCase())) {
-      throw new Error("Gemini returned a preferred skill not stated in the job description.")
+      logGeminiDiagnostic("validation", {
+        errorCode: "UNSUPPORTED_PREFERRED_SKILL_DROPPED",
+        field: `skills[${index}].skill`,
+      })
+      return []
     }
     const relatedTerms = readStringArray(item.relatedTerms, "related terms", 8)
-    if (relatedTerms.some((term) => !isEvidenceInResume(term, resumeText))) {
-      throw new Error("Gemini returned a related term without resume evidence.")
+    const supportedRelatedTerms = relatedTerms.filter((term) => isEvidenceInResume(term, resumeText))
+    if (supportedRelatedTerms.length !== relatedTerms.length) {
+      logGeminiDiagnostic("validation", {
+        errorCode: "UNSUPPORTED_RELATED_TERM_DROPPED",
+        field: `skills[${index}].relatedTerms`,
+        optionalTermsDropped: relatedTerms.length - supportedRelatedTerms.length,
+      })
     }
+    const evidenceIsValid = typeof item.evidence === "string" &&
+      item.evidence.trim().length > 0 &&
+      item.evidence.trim().length <= 600 &&
+      isEvidenceInResume(item.evidence.trim(), resumeText)
     if (status === "not_found") {
-      if (item.evidence !== null || relatedTerms.length) {
-        throw new Error("Gemini must not attach evidence to a not-found skill.")
+      if (item.evidence !== null) {
+        logGeminiDiagnostic("validation", {
+          errorCode: "EVIDENCE_REMOVED_FROM_NOT_FOUND_SKILL",
+          field: `skills[${index}].evidence`,
+        })
       }
-      return { skill, priority, status, evidence: null, relatedTerms: [] }
+      return [{ skill, priority, status, evidence: null, relatedTerms: [] }]
     }
-    if (typeof item.evidence !== "string") throw new Error("Invalid Gemini skill evidence.")
-    const evidence = item.evidence.trim()
-    if (!evidence || evidence.length > 600 || !isEvidenceInResume(evidence, resumeText)) {
-      throw new Error("Gemini returned skill evidence not found in the resume.")
+    if (!evidenceIsValid) {
+      const groundedEvidence = findSkillEvidenceExcerpt(skill, resumeText)
+      logGeminiDiagnostic("validation", {
+        errorCode: groundedEvidence ? "UNSUPPORTED_SKILL_EVIDENCE_DOWNGRADED" : "UNSUPPORTED_SKILL_EVIDENCE_NOT_FOUND",
+        field: `skills[${index}].evidence`,
+        replacementStatus: groundedEvidence ? "uncertain" : "not_found",
+      })
+      return [groundedEvidence
+        ? { skill, priority, status: "uncertain", evidence: groundedEvidence, relatedTerms: supportedRelatedTerms }
+        : { skill, priority, status: "not_found", evidence: null, relatedTerms: [] }]
     }
-    return { skill, priority, status, evidence, relatedTerms }
+    const evidence = (item.evidence as string).trim()
+    return [{ skill, priority, status, evidence, relatedTerms: supportedRelatedTerms }]
   })
 
   for (const reqSkill of jobRequirements.requiredSkills) {
@@ -402,9 +482,9 @@ export function validateGeminiResumeInsights(
 
   return {
     skills: readSkillInsights(value.skills, resumeText, jobRequirements),
-    relevantProjectsAndExperience: readEvidenceArray(value.relevantProjectsAndExperience, "experience", resumeText),
-    transferableExperience: readEvidenceArray(value.transferableExperience, "transferable experience", resumeText),
-    strengths: readEvidenceArray(value.strengths, "strengths", resumeText),
+    relevantProjectsAndExperience: readEvidenceArray(value.relevantProjectsAndExperience, "experience", resumeText, true),
+    transferableExperience: readEvidenceArray(value.transferableExperience, "transferable experience", resumeText, true),
+    strengths: readEvidenceArray(value.strengths, "strengths", resumeText, true),
     improvementSuggestions: readImprovementSuggestions(value.improvementSuggestions, resumeText),
     atsContextualNotes: readEvidenceArray(value.atsContextualNotes, "ATS contextual notes", resumeText, true),
     coachSuggestions: readCoachSuggestions(value.coachSuggestions, resumeText),
@@ -421,7 +501,11 @@ function parseErrorDetails(err: unknown): { status?: number | string; errorCode?
   const code = String(status || errorCode)
 
   let category = "PROVIDER_ERROR"
-  if (code === "401" || code === "403" || msg.includes("API key not valid") || msg.includes("PERMISSION_DENIED")) {
+  if (e.stage === "response_validation") {
+    category = "VALIDATION_ERROR"
+  } else if (e.stage === "response_parsing") {
+    category = "RESPONSE_PARSE_ERROR"
+  } else if (code === "401" || code === "403" || msg.includes("API key not valid") || msg.includes("PERMISSION_DENIED")) {
     category = "AUTH_ERROR"
   } else if (code === "404" || msg.includes("NOT_FOUND")) {
     category = "MODEL_NOT_FOUND"
@@ -433,7 +517,9 @@ function parseErrorDetails(err: unknown): { status?: number | string; errorCode?
     category = "TIMEOUT"
   }
 
-  const sanitizedMessage = msg.split("\n")[0].slice(0, 200)
+  const apiKey = process.env.GEMINI_API_KEY
+  const firstLine = msg.split("\n")[0].slice(0, 200)
+  const sanitizedMessage = apiKey ? firstLine.replaceAll(apiKey, "[redacted]") : firstLine
   return { status, errorCode, category, message: sanitizedMessage }
 }
 
@@ -448,6 +534,12 @@ function getGeminiFailureMessage(err: unknown): string {
   const { status, category, message } = parseErrorDetails(err)
   const code = String(status ?? "")
 
+  if (category === "VALIDATION_ERROR") {
+    return "Gemini returned insights that did not pass evidence and format checks. See server diagnostics for the failed field."
+  }
+  if (category === "RESPONSE_PARSE_ERROR") {
+    return "Gemini returned an unreadable response. Try again or check server diagnostics."
+  }
   if (message.includes("GEMINI_API_KEY is not configured")) {
     return "Gemini is not configured: GEMINI_API_KEY is missing. Add it to .env.local and restart the dev server."
   }
@@ -475,7 +567,64 @@ function getGeminiFailureMessage(err: unknown): string {
   return "Gemini request failed. Check the server terminal for Gemini Diagnostics."
 }
 
-async function requestGeminiText(prompt: string): Promise<string | undefined> {
+export async function requestGeminiModelWithFallback(
+  candidateModels: readonly string[],
+  requestModel: (model: string) => Promise<string | undefined>,
+): Promise<string> {
+  if (!candidateModels.length) throw new Error("No Gemini models are configured.")
+
+  for (let index = 0; index < candidateModels.length; index += 1) {
+    const model = candidateModels[index]
+    let responseText: string | undefined
+    try {
+      responseText = await requestModel(model)
+    } catch (err: unknown) {
+      const { status, errorCode, category, message } = parseErrorDetails(err)
+      logGeminiDiagnostic("request", {
+        model,
+        status: status ?? "unknown",
+        errorCode: errorCode ?? "unknown",
+        errorCategory: category,
+        message,
+      })
+      const code = String(status ?? errorCode ?? "")
+      const shouldTryFallback = category === "MODEL_NOT_FOUND" ||
+        category === "RATE_LIMIT_OR_OVERLOAD" ||
+        category === "TIMEOUT" ||
+        /^5\d\d$/.test(code)
+      if (!shouldTryFallback || index === candidateModels.length - 1) throw err
+
+      logGeminiDiagnostic("model_fallback", {
+        failedModel: model,
+        nextModel: candidateModels[index + 1],
+        errorCategory: category,
+        status: status ?? "unknown",
+      })
+      continue
+    }
+
+    if (responseText) {
+      logGeminiDiagnostic("response", {
+        model,
+        isEmpty: false,
+        responseLength: responseText.length,
+      })
+      return responseText
+    }
+
+    logGeminiDiagnostic("response", {
+      model,
+      isEmpty: true,
+      errorCategory: "EMPTY_RESPONSE",
+      message: "Model returned empty text",
+    })
+    throw new Error("Gemini returned an empty response.")
+  }
+
+  throw new Error("Gemini returned an empty response.")
+}
+
+async function requestGeminiText(prompt: string): Promise<string> {
   const apiKeyConfigured = Boolean(process.env.GEMINI_API_KEY)
   if (!apiKeyConfigured) {
     logGeminiDiagnostic("configuration", {
@@ -486,12 +635,11 @@ async function requestGeminiText(prompt: string): Promise<string | undefined> {
     throw new Error("Gemini API is not configured.")
   }
 
-  const primaryModel = process.env.GEMINI_MODEL || "gemini-3.1-flash-lite"
+  const primaryModel = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite"
   const candidateModels = [
     primaryModel,
-    "gemini-3.1-flash-lite",
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.5-flash",
   ].filter((model, idx, arr) => arr.indexOf(model) === idx)
 
   const ai = new GoogleGenAI({
@@ -499,62 +647,20 @@ async function requestGeminiText(prompt: string): Promise<string | undefined> {
     httpOptions: { timeout: 20_000 },
   })
 
-  let lastError: unknown
-  for (const model of candidateModels) {
-    try {
-      const response = await ai.models.generateContent({
-        model,
-        contents: prompt,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema,
-          temperature: 0.1,
-          maxOutputTokens: 4096,
-          httpOptions: { timeout: 20_000 },
-        },
-      })
-      if (response.text) {
-        logGeminiDiagnostic("response", {
-          model,
-          apiKeyConfigured: true,
-          isEmpty: false,
-          responseLength: response.text.length,
-        })
-        return response.text
-      }
-      logGeminiDiagnostic("request", {
-        model,
-        apiKeyConfigured: true,
-        isEmpty: true,
-        errorCategory: "EMPTY_RESPONSE",
-        message: "Model returned empty text",
-      })
-      break
-    } catch (err: unknown) {
-      lastError = err
-      const { status, errorCode, category, message } = parseErrorDetails(err)
-      logGeminiDiagnostic("request", {
-        model,
-        apiKeyConfigured: true,
-        status: status ?? "unknown",
-        errorCode: errorCode ?? "unknown",
-        errorCategory: category,
-        message,
-      })
-      if (category !== "MODEL_NOT_FOUND") {
-        throw err
-      }
-    }
-  }
-
-  if (lastError) throw lastError
-  logGeminiDiagnostic("response", {
-    apiKeyConfigured: true,
-    isEmpty: true,
-    errorCategory: "EMPTY_RESPONSE",
-    message: "Gemini returned an empty response after trying candidate models",
+  return requestGeminiModelWithFallback(candidateModels, async (model) => {
+    const response = await ai.models.generateContent({
+      model,
+      contents: prompt,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema,
+        temperature: 0.1,
+        maxOutputTokens: 4096,
+        httpOptions: { timeout: 20_000 },
+      },
+    })
+    return response.text
   })
-  throw new Error("Gemini returned an empty response.")
 }
 
 export async function getGeminiResumeInsights(
@@ -596,12 +702,12 @@ export async function getGeminiResumeInsights(
   let response: unknown
   try {
     response = JSON.parse(responseText)
-  } catch {
+  } catch (error) {
     logGeminiDiagnostic("parsing", {
       errorCategory: "PARSE_ERROR",
       message: "Model response could not be parsed as JSON",
     })
-    throw new Error("Gemini returned invalid JSON.")
+    throw new GeminiStageError("response_parsing", "Gemini returned invalid JSON.", error)
   }
 
   try {
@@ -617,7 +723,11 @@ export async function getGeminiResumeInsights(
       errorCategory: "VALIDATION_ERROR",
       message: err instanceof Error ? err.message : "Response validation failed",
     })
-    throw err
+    throw new GeminiStageError(
+      "response_validation",
+      err instanceof Error ? err.message : "Gemini response failed validation.",
+      err,
+    )
   }
 }
 
@@ -641,13 +751,12 @@ export async function addGeminiInsights(
         candidate.geminiInsightsUnavailable = true
       }
     } catch (err) {
-      const { status, category } = parseErrorDetails(err)
+      const { status, errorCode, category } = parseErrorDetails(err)
       const userMessage = getGeminiFailureMessage(err)
       logGeminiDiagnostic("candidate_enrichment", {
-        candidateId: candidate.id,
         errorCategory: category,
         status: status ?? "unknown",
-        reason: err instanceof Error ? err.message : "Unknown error",
+        errorCode: errorCode ?? "unknown",
       })
       candidate.geminiInsightsUnavailable = true
       candidate.geminiInsightsError = userMessage

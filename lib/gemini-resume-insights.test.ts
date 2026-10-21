@@ -5,6 +5,7 @@ import { analyzeResumeText, rankCandidates } from "./resume-analysis"
 import {
   addGeminiInsights,
   getGeminiResumeInsights,
+  requestGeminiModelWithFallback,
   validateGeminiResumeInsights,
 } from "./gemini-resume-insights"
 
@@ -59,10 +60,29 @@ test("validates structured insights and resume-grounded evidence", () => {
     () => validateGeminiResumeInsights({ ...validResponse, skills: validResponse.skills.slice(0, 1) }, resumeText, requirements),
     /omitted a required skill/,
   )
-  assert.throws(
-    () => validateGeminiResumeInsights({ ...validResponse, skills: [{ ...validResponse.skills[1], evidence: "no evidence" }] }, resumeText, requirements),
-    /not-found skill/,
-  )
+  const invalidNotFoundEvidence = validateGeminiResumeInsights({
+    ...validResponse,
+    skills: [{ ...validResponse.skills[1], evidence: "no evidence" }, validResponse.skills[0]],
+  }, resumeText, requirements)
+  assert.equal(invalidNotFoundEvidence.skills.find(({ skill }) => skill === "PostgreSQL")?.status, "not_found")
+  assert.equal(invalidNotFoundEvidence.skills.find(({ skill }) => skill === "PostgreSQL")?.evidence, null)
+})
+
+test("downgrades unsupported skill evidence to an exact resume excerpt or not-found", () => {
+  const response = {
+    ...validResponse,
+    skills: [
+      { ...validResponse.skills[0], evidence: "Led a team of 10 engineers", status: "demonstrated" },
+      { ...validResponse.skills[1], evidence: "not in resume", status: "demonstrated" },
+    ],
+  }
+
+  const insights = validateGeminiResumeInsights(response, resumeText, requirements)
+
+  assert.equal(insights.skills[0].status, "uncertain")
+  assert.equal(insights.skills[0].evidence, resumeText.split("\n")[2])
+  assert.equal(insights.skills[1].status, "uncertain")
+  assert.equal(insights.skills[1].evidence, resumeText.split("\n")[2])
 })
 
 test("recognizes equivalent terminology for preferred skills when resume evidence supports it", () => {
@@ -92,6 +112,22 @@ test("recognizes equivalent terminology for preferred skills when resume evidenc
   assert.deepEqual(restInsight?.relatedTerms, ["HTTP endpoints"])
 })
 
+test("drops hallucinated optional skills without changing required-skill semantics", () => {
+  const insights = validateGeminiResumeInsights({
+    ...validResponse,
+    skills: [
+      ...validResponse.skills,
+      { skill: "Invented Framework", priority: "preferred", status: "demonstrated", evidence: "Built backend services", relatedTerms: [] },
+      { skill: "Unrequested Tool", priority: "required", status: "demonstrated", evidence: "Built backend services", relatedTerms: [] },
+    ],
+  }, resumeText, requirements)
+
+  assert.deepEqual(insights.skills.map(({ skill, priority }) => ({ skill, priority })), [
+    { skill: "TypeScript", priority: "required" },
+    { skill: "PostgreSQL", priority: "required" },
+  ])
+})
+
 test("marks ambiguous resume evidence as uncertain rather than not-found", () => {
   const resume = `${resumeText}\nSupported PostgreSQL backups with guidance from a senior engineer.`
   const response = {
@@ -106,26 +142,149 @@ test("marks ambiguous resume evidence as uncertain rather than not-found", () =>
   assert.equal(insights.skills.find(({ skill }) => skill === "PostgreSQL")?.evidence, "Supported PostgreSQL backups")
 })
 
+test("drops unsupported optional related terms while preserving validated required skills", () => {
+  const response = {
+    ...validResponse,
+    skills: validResponse.skills.map((skill) => skill.skill === "TypeScript"
+      ? { ...skill, relatedTerms: ["Invented framework"] }
+      : skill),
+  }
+
+  const insights = validateGeminiResumeInsights(response, resumeText, requirements)
+
+  assert.deepEqual(insights.skills.map(({ skill, priority }) => ({ skill, priority })), [
+    { skill: "TypeScript", priority: "required" },
+    { skill: "PostgreSQL", priority: "required" },
+  ])
+  assert.deepEqual(insights.skills[0].relatedTerms, [])
+})
+
 test("rejects invalid model JSON and response shape", async () => {
   await assert.rejects(
     getGeminiResumeInsights(resumeText, requirements, true, async () => "not json"),
     /invalid JSON/,
   )
   await assert.rejects(
-    getGeminiResumeInsights(resumeText, requirements, true, async () => JSON.stringify({ ...validResponse, strengths: [{ finding: "", status: "demonstrated", evidence: "Built backend services" }] })),
+    getGeminiResumeInsights(resumeText, requirements, true, async () => JSON.stringify({ ...validResponse, strengths: "invalid" })),
     /Invalid Gemini strengths/,
   )
   assert.throws(
     () => validateGeminiResumeInsights({
       ...validResponse,
-      improvementSuggestions: [{ suggestion: "Add detail.", evidenceStatus: "demonstrated", evidence: "not in resume" }],
+      improvementSuggestions: "invalid",
     }, resumeText, requirements),
-    /evidence/,
+    /Invalid Gemini suggestions/,
   )
   assert.throws(
-    () => validateGeminiResumeInsights({ ...validResponse, strengths: [] }, resumeText, requirements),
+    () => validateGeminiResumeInsights({ ...validResponse, strengths: "invalid" }, resumeText, requirements),
     /Invalid Gemini strengths/,
   )
+})
+
+test("drops invalid optional evidence items without discarding valid findings", () => {
+  const insights = validateGeminiResumeInsights({
+    ...validResponse,
+    strengths: [
+      { finding: "Led a team of ten engineers", status: "demonstrated", evidence: "Led a team of ten engineers" },
+      ...validResponse.strengths,
+    ],
+    improvementSuggestions: [
+      { suggestion: "Add an unsupported 40% metric.", evidenceStatus: "demonstrated", evidence: "Improved performance by 40%" },
+      ...validResponse.improvementSuggestions,
+    ],
+  }, resumeText, requirements)
+
+  assert.deepEqual(insights.strengths, validResponse.strengths)
+  assert.deepEqual(insights.improvementSuggestions, validResponse.improvementSuggestions)
+  assert.deepEqual(insights.skills, validResponse.skills)
+})
+
+test("uses the next Gemini model after transient provider availability errors", async () => {
+  const attemptedModels: string[] = []
+  const response = await requestGeminiModelWithFallback(
+    ["gemini-primary", "gemini-fallback"],
+    async (model) => {
+      attemptedModels.push(model)
+      if (model === "gemini-primary") {
+        throw new Error('got status: 504 Gateway Timeout. {"error":{"code":504,"status":"DEADLINE_EXCEEDED"}}')
+      }
+      return JSON.stringify(validResponse)
+    },
+  )
+
+  assert.equal(response, JSON.stringify(validResponse))
+  assert.deepEqual(attemptedModels, ["gemini-primary", "gemini-fallback"])
+})
+
+test("does not retry another model after a non-retryable Gemini request error", async () => {
+  const attemptedModels: string[] = []
+  await assert.rejects(
+    requestGeminiModelWithFallback(["gemini-primary", "gemini-fallback"], async (model) => {
+      attemptedModels.push(model)
+      throw new Error('got status: 400 Bad Request. {"error":{"code":400}}')
+    }),
+    /400 Bad Request/,
+  )
+
+  assert.deepEqual(attemptedModels, ["gemini-primary"])
+})
+
+test("redacts configured API keys from server diagnostics", async () => {
+  const apiKey = "test-gemini-key"
+  const originalApiKey = process.env.GEMINI_API_KEY
+  const originalWarn = console.warn
+  const warnings: string[] = []
+  process.env.GEMINI_API_KEY = apiKey
+  console.warn = (...args: unknown[]) => { warnings.push(args.join(" ")) }
+
+  try {
+    await assert.rejects(
+      requestGeminiModelWithFallback(["gemini-primary"], async () => {
+        throw new Error(`got status: 403 Forbidden. key=${apiKey}`)
+      }),
+      /403 Forbidden/,
+    )
+  } finally {
+    if (originalApiKey === undefined) delete process.env.GEMINI_API_KEY
+    else process.env.GEMINI_API_KEY = originalApiKey
+    console.warn = originalWarn
+  }
+
+  assert.ok(warnings.length)
+  assert.ok(!warnings.join(" ").includes(apiKey))
+})
+
+test("drops an unsupported optional coach suggestion without discarding valid insights", () => {
+  const response = {
+    ...validResponse,
+    coachSuggestions: [
+      {
+        type: "bullet_point",
+        priority: "high",
+        originalText: "Built backend services",
+        proposedText: "Led a team of 10 engineers to build backend services",
+        rationale: "Emphasize leadership.",
+        supportingEvidence: ["Built backend services"],
+        confirmationQuestions: [],
+      },
+      {
+        type: "bullet_point",
+        priority: "medium",
+        originalText: "Built backend services",
+        proposedText: "Built backend services",
+        rationale: "Keep the evidenced work clear.",
+        supportingEvidence: ["Built backend services"],
+        confirmationQuestions: [],
+      },
+    ],
+  }
+
+  const insights = validateGeminiResumeInsights(response, resumeText, requirements)
+
+  assert.deepEqual(insights.skills, validResponse.skills)
+  assert.equal(insights.strengths.length, validResponse.strengths.length)
+  assert.equal(insights.coachSuggestions.length, 1)
+  assert.equal(insights.coachSuggestions[0].id, "coach-2")
 })
 
 test("parses a successful Gemini JSON response into typed insights", async () => {
@@ -153,8 +312,8 @@ test("accepts a rewrite grounded in exact resume text", () => {
   assert.equal(result.coachSuggestions[0].proposedText, suggestion.proposedText)
 })
 
-test("rejects fabricated metrics and claims in proposed resume text", () => {
-  assert.throws(() => validateGeminiResumeInsights({
+test("drops coach suggestions with fabricated metrics while preserving other insights", () => {
+  const insights = validateGeminiResumeInsights({
     ...validResponse,
     coachSuggestions: [{
       type: "bullet_point",
@@ -165,10 +324,14 @@ test("rejects fabricated metrics and claims in proposed resume text", () => {
       supportingEvidence: ["Built backend services using TypeScript"],
       confirmationQuestions: [],
     }],
-  }, resumeText, requirements), /unsupported resume claims/)
+  }, resumeText, requirements)
+
+  assert.equal(insights.coachSuggestions.length, 0)
+  assert.deepEqual(insights.skills, validResponse.skills)
+  assert.deepEqual(insights.strengths, validResponse.strengths)
 })
 
-test("requires explicit confirmation placeholders for missing facts", () => {
+test("requires explicit confirmation placeholders and drops invalid optional drafts", () => {
   const suggestion = {
     type: "missing_evidence",
     priority: "low",
@@ -185,15 +348,16 @@ test("requires explicit confirmation placeholders for missing facts", () => {
   assert.equal(result.coachSuggestions[0].proposedText, "{{CONFIRM_0}}")
   assert.equal(result.coachSuggestions[0].confirmationQuestions.length, 1)
 
-  assert.throws(() => validateGeminiResumeInsights({
+  const invalid = validateGeminiResumeInsights({
     ...validResponse,
     coachSuggestions: [{ ...suggestion, proposedText: "Improved performance" }],
-  }, resumeText, requirements), /placeholder/)
+  }, resumeText, requirements)
+  assert.equal(invalid.coachSuggestions.length, 0)
 })
 
 test("does not allow a rewrite to borrow unsupported words from unrelated resume sections", () => {
   const text = `${resumeText}\nUnrelated note: improved performance by 40%.`
-  assert.throws(() => validateGeminiResumeInsights({
+  const insights = validateGeminiResumeInsights({
     ...validResponse,
     coachSuggestions: [{
       type: "bullet_point",
@@ -204,7 +368,10 @@ test("does not allow a rewrite to borrow unsupported words from unrelated resume
       supportingEvidence: ["Built backend services using TypeScript"],
       confirmationQuestions: [],
     }],
-  }, text, requirements), /unsupported resume claims/)
+  }, text, requirements)
+
+  assert.equal(insights.coachSuggestions.length, 0)
+  assert.deepEqual(insights.skills, validResponse.skills)
 })
 
 test("Gemini failure preserves deterministic scores and ranking", async () => {
