@@ -12,6 +12,7 @@ import { Slider } from "@/components/ui/slider"
 import { Badge } from "@/components/ui/badge"
 import { X, Briefcase, GraduationCap, ListChecks } from "lucide-react"
 import type { JobRequirements } from "@/lib/types"
+import { extractSkillsFromJobDescription, mergeJobSkills, normalizeSkill } from "@/lib/job-skills"
 import { motion } from "framer-motion"
 
 interface JobRequirementsFormProps {
@@ -23,30 +24,49 @@ export function JobRequirementsForm({ onSubmit }: JobRequirementsFormProps) {
   const [jobDescription, setJobDescription] = useState("")
   const [experienceYears, setExperienceYears] = useState(3)
   const [skillInput, setSkillInput] = useState("")
-  const [skills, setSkills] = useState<string[]>([])
+  const [detectedSkills, setDetectedSkills] = useState<string[]>([])
+  const [manualSkills, setManualSkills] = useState<string[]>([])
+  const [removedSkills, setRemovedSkills] = useState<string[]>([])
   const [educationLevel, setEducationLevel] = useState("Bachelor's")
+  const [validationMessage, setValidationMessage] = useState("")
+
+  const skills = mergeJobSkills(detectedSkills, manualSkills, removedSkills)
 
   const addSkill = () => {
-    if (skillInput.trim() && !skills.includes(skillInput.trim())) {
-      setSkills([...skills, skillInput.trim()])
-      setSkillInput("")
+    const skill = normalizeSkill(skillInput)
+    if (!skill) return
+    if (detectedSkills.includes(skill)) setRemovedSkills(removedSkills.filter((item) => item !== skill))
+    else if (!manualSkills.some((item) => item.toLocaleLowerCase() === skill.toLocaleLowerCase())) {
+      setManualSkills([...manualSkills, skill])
     }
+    setSkillInput("")
   }
 
   const removeSkill = (skill: string) => {
-    setSkills(skills.filter((s) => s !== skill))
+    setManualSkills(manualSkills.filter((item) => item !== skill))
+    if (detectedSkills.includes(skill) && !removedSkills.includes(skill)) {
+      setRemovedSkills([...removedSkills, skill])
+    }
   }
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
 
-    if (!jobTitle || !jobDescription || skills.length === 0) {
+    if (!jobTitle.trim() || !jobDescription.trim() || skills.length === 0) {
+      setValidationMessage(
+        !jobTitle.trim()
+          ? "Enter a job title."
+          : !jobDescription.trim()
+            ? "Enter a job description."
+            : "Add or detect at least one required skill.",
+      )
       return
     }
 
+    setValidationMessage("")
     const requirements: JobRequirements = {
-      jobTitle,
-      jobDescription,
+      jobTitle: jobTitle.trim(),
+      jobDescription: jobDescription.trim(),
       requiredSkills: skills,
       minimumExperience: experienceYears,
       educationLevel,
@@ -56,12 +76,11 @@ export function JobRequirementsForm({ onSubmit }: JobRequirementsFormProps) {
   }
 
   return (
-    <Card className="w-full overflow-hidden bg-white/90 backdrop-blur-sm border-none shadow-xl">
-      <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500"></div>
+    <Card className="w-full overflow-hidden border border-slate-800 bg-[#101a2b] text-slate-100 shadow-xl">
       <form onSubmit={handleSubmit}>
         <CardHeader className="space-y-1">
           <CardTitle className="text-2xl font-bold">Job Requirements</CardTitle>
-          <CardDescription>Define the requirements for the position you're hiring for</CardDescription>
+          <CardDescription className="text-slate-400">Define the role and review skills detected from its description.</CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">
           <div className="space-y-2">
@@ -77,7 +96,7 @@ export function JobRequirementsForm({ onSubmit }: JobRequirementsFormProps) {
               value={jobTitle}
               onChange={(e) => setJobTitle(e.target.value)}
               required
-              className="border-indigo-100 focus-visible:ring-indigo-500"
+              className="border-slate-700 bg-[#0b1424] text-slate-100 placeholder:text-slate-500 focus-visible:ring-sky-400"
             />
           </div>
 
@@ -88,9 +107,13 @@ export function JobRequirementsForm({ onSubmit }: JobRequirementsFormProps) {
               placeholder="Enter the full job description..."
               rows={5}
               value={jobDescription}
-              onChange={(e) => setJobDescription(e.target.value)}
+              onChange={(e) => {
+                const description = e.target.value
+                setJobDescription(description)
+                setDetectedSkills(extractSkillsFromJobDescription(description))
+              }}
               required
-              className="border-indigo-100 focus-visible:ring-indigo-500"
+              className="border-slate-700 bg-[#0b1424] text-slate-100 placeholder:text-slate-500 focus-visible:ring-sky-400"
             />
           </div>
 
@@ -110,12 +133,12 @@ export function JobRequirementsForm({ onSubmit }: JobRequirementsFormProps) {
                     addSkill()
                   }
                 }}
-                className="border-purple-100 focus-visible:ring-purple-500"
+                className="border-slate-700 bg-[#0b1424] text-slate-100 placeholder:text-slate-500 focus-visible:ring-sky-400"
               />
               <Button
                 type="button"
                 onClick={addSkill}
-                className="bg-gradient-to-r from-purple-500 to-indigo-500 hover:from-purple-600 hover:to-indigo-600 transition-all duration-300"
+                className="bg-sky-500 text-slate-950 hover:bg-sky-400 transition-colors"
               >
                 Add
               </Button>
@@ -131,14 +154,17 @@ export function JobRequirementsForm({ onSubmit }: JobRequirementsFormProps) {
                 >
                   <Badge
                     variant="secondary"
-                    className="flex items-center gap-1 bg-gradient-to-r from-indigo-100 to-purple-100 text-indigo-700 hover:from-indigo-200 hover:to-purple-200 px-3 py-1"
+                    className="flex items-center gap-1 border border-sky-400/20 bg-sky-400/10 px-3 py-1 text-sky-200 hover:bg-sky-400/20"
                   >
                     {skill}
-                    <X className="h-3 w-3 cursor-pointer text-indigo-700" onClick={() => removeSkill(skill)} />
+                    <button type="button" aria-label={`Remove ${skill}`} onClick={() => removeSkill(skill)} className="rounded-sm text-sky-200 hover:text-white"><X className="h-3 w-3" /></button>
                   </Badge>
                 </motion.div>
               ))}
             </div>
+            <p className="text-xs text-muted-foreground">
+              Skills detected from the job description can be edited before continuing.
+            </p>
           </div>
 
           <div className="space-y-2">
@@ -175,7 +201,7 @@ export function JobRequirementsForm({ onSubmit }: JobRequirementsFormProps) {
             </div>
             <select
               id="education"
-              className="w-full p-2 border rounded-md border-indigo-100 focus:ring-2 focus:ring-indigo-500 focus:outline-none"
+              className="w-full rounded-md border border-slate-700 bg-[#0b1424] p-2 text-slate-100 focus:outline-none focus:ring-2 focus:ring-sky-400"
               value={educationLevel}
               onChange={(e) => setEducationLevel(e.target.value)}
             >
@@ -188,12 +214,15 @@ export function JobRequirementsForm({ onSubmit }: JobRequirementsFormProps) {
           </div>
         </CardContent>
         <CardFooter>
-          <Button
-            type="submit"
-            className="w-full bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 hover:from-indigo-600 hover:via-purple-600 hover:to-pink-600 transition-all duration-300 shadow-md"
-          >
-            Continue to Resume Upload
-          </Button>
+          <div className="w-full space-y-3">
+            {validationMessage && <p role="alert" className="text-sm text-red-500">{validationMessage}</p>}
+            <Button
+              type="submit"
+              className="w-full bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 hover:from-indigo-600 hover:via-purple-600 hover:to-pink-600 transition-all duration-300 shadow-md"
+            >
+              Continue to Resume Upload
+            </Button>
+          </div>
         </CardFooter>
       </form>
     </Card>

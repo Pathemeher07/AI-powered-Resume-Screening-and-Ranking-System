@@ -2,9 +2,8 @@ import type { Metadata } from 'next'
 import './globals.css'
 
 export const metadata: Metadata = {
-  title: 'Resume Analyzer',
-  description: 'Created with Vercel',
-  generator: 'Vercel.dev',
+  title: 'RecruitAI | Candidate Screening',
+  description: 'Evidence-based resume screening and candidate ranking',
 }
 
 export default function RootLayout({
@@ -13,7 +12,7 @@ export default function RootLayout({
   children: React.ReactNode
 }>) {
   return (
-    <html lang="en">
+    <html lang="en" className="dark">
       <body>{children}</body>
     </html>
   )
